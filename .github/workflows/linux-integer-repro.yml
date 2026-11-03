@@ -1,0 +1,126 @@
+name: Linux integer-bound reproducer
+
+on:
+  push:
+    branches: [ci/linux-integer-bounds-20261103]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    name: llguidance ${{ matrix.package }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ["1.7.6", "1.8.0", "patched"]
+    env:
+      PACKAGE: ${{ matrix.package }}
+      PATCH_SHA: 6e097f3cec70b8772919497da2bd3dbdac283003
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 6e097f3cec70b8772919497da2bd3dbdac283003
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Record environment
+        run: |
+          uname -a
+          cat /etc/os-release
+          python --version
+          rustc --version
+          git rev-parse HEAD
+      - name: Install llguidance
+        run: |
+          if [ "$PACKAGE" = patched ]; then
+            python -m pip install --verbose .
+          else
+            python -m pip install "llguidance==$PACKAGE"
+          fi
+      - name: Reproduce integer-bound behavior
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import platform
+          from importlib.metadata import version
+          from pathlib import Path
+
+          from llguidance import LLMatcher, LLTokenizer, grammar_from
+
+          assert platform.system() == "Linux"
+          assert platform.machine() == "x86_64"
+          tok = LLTokenizer.from_tiktoken(
+              encoder={bytes([b]): b for b in range(256)},
+              special_tokens={"<|eos|>": 256},
+              pattern=r"(?s).",
+              eos_token=256,
+              n_vocab=257,
+          )
+          cases = [
+              ({"minimum": 9007199254740993}, "9007199254740992"),
+              ({"exclusiveMinimum": 9007199254740992}, "9007199254740992"),
+              ({"minimum": -9223372036854775808}, "-9223372036854775808"),
+              (
+                  {"minimum": -9223372036854776000, "maximum": 9223372036854776000},
+                  "9223372036854776000",
+              ),
+          ]
+          expected = (
+              ["reject", "reject", "accept", "accept"]
+              if os.environ["PACKAGE"] == "patched"
+              else ["accept", "accept", "compile_error", "compile_error"]
+          )
+          results = []
+          for (bounds, value), outcome in zip(cases, expected):
+              schema = {"type": "integer", **bounds}
+              grammar = 'start: value "!"\nvalue: %json ' + json.dumps(schema)
+              error = None
+              try:
+                  matcher = LLMatcher(tok, grammar_from("lark", grammar))
+                  if matcher.is_error():
+                      actual = "compile_error"
+                      error = matcher.get_error()
+                  else:
+                      tokens = list((value + "!").encode())
+                      accepted = (
+                          matcher.try_consume_tokens(tokens) == len(tokens)
+                          and matcher.is_accepting()
+                      )
+                      actual = "accept" if accepted else "reject"
+              except Exception as exc:
+                  actual = "compile_error"
+                  error = str(exc)
+              results.append({
+                  "schema": schema,
+                  "value": value,
+                  "expected_observation": outcome,
+                  "actual": actual,
+                  "error": error,
+              })
+          report = {
+              "platform": platform.platform(),
+              "python": platform.python_version(),
+              "llguidance": version("llguidance"),
+              "package": os.environ["PACKAGE"],
+              "patch_sha": os.environ["PATCH_SHA"],
+              "results": results,
+          }
+          text = json.dumps(report, indent=2)
+          print(text)
+          Path("integer-bound-results.json").write_text(text + "\n")
+          for result in results:
+              assert result["actual"] == result["expected_observation"], result
+              if result["actual"] == "compile_error":
+                  assert "Failed to generate regex for integer range" in result["error"], result
+          PY
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: integer-bounds-${{ matrix.package }}
+          path: integer-bound-results.json
+          if-no-files-found: warn
